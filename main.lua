@@ -1,6 +1,7 @@
 --[[
     Dex++ Ultimate Debugging Suite
     Custom lightweight build with built-in Telegram API integration.
+    Includes Unity-style UI, Splash Screen, and robust file uploading.
 ]]
 
 local TELEGRAM_BOT_TOKEN = "8305869255:AAEqIdORQUnQgg82LKbVwsj6Rzpfow0tKqo"
@@ -29,7 +30,7 @@ gui.Parent = gethui()
 -- [ 1. STARTUP SPLASH SCREEN ]
 local splashBg = Instance.new("Frame")
 splashBg.Size = UDim2.new(1, 0, 1, 0)
-splashBg.BackgroundColor3 = Color3.fromRGB(35, 142, 90) -- Green background
+splashBg.BackgroundColor3 = Color3.fromRGB(35, 142, 90)
 splashBg.BorderSizePixel = 0
 splashBg.ZIndex = 10
 splashBg.Parent = gui
@@ -93,7 +94,6 @@ mainFrame.BorderSizePixel = 0
 mainFrame.Visible = false
 mainFrame.Parent = gui
 
--- Top Bar
 local topBar = Instance.new("Frame")
 topBar.Size = UDim2.new(1, 0, 0, 25)
 topBar.BackgroundColor3 = Color3.fromRGB(51, 51, 51)
@@ -131,7 +131,6 @@ topBar.InputEnded:Connect(function(input)
     end
 end)
 
--- Left Panel (Tree)
 local treePanel = Instance.new("Frame")
 treePanel.Size = UDim2.new(0.6, -2, 1, -27)
 treePanel.Position = UDim2.new(0, 0, 0, 27)
@@ -153,7 +152,6 @@ local treeLayout = Instance.new("UIListLayout")
 treeLayout.Parent = treeList
 treeLayout.SortOrder = Enum.SortOrder.LayoutOrder
 
--- Right Panel (Properties)
 local propPanel = Instance.new("Frame")
 propPanel.Size = UDim2.new(0.4, -2, 1, -27)
 propPanel.Position = UDim2.new(0.6, 2, 0, 27)
@@ -176,10 +174,237 @@ propLayout.Parent = propList
 propLayout.SortOrder = Enum.SortOrder.LayoutOrder
 
 
--- [ 3. EXPLORER LOGIC ]
+-- [ 3. TELEGRAM LOGIC ]
+local function sendToTelegram(obj)
+    task.spawn(function()
+        local escapeHtml = function(str)
+            str = tostring(str)
+            str = str:gsub("&", "&amp;")
+            str = str:gsub("<", "&lt;")
+            str = str:gsub(">", "&gt;")
+            return str
+        end
+        
+        local fullName = obj:GetFullName()
+        local className = obj.ClassName
+        
+        local propsList = {}
+        local knownProps = {
+            "Name", "ClassName", "Parent", "Position", "Size", "Color", 
+            "Transparency", "Anchored", "CanCollide", "Value", "Text", 
+            "Source", "Disabled", "RunContext", "Archivable", "Locked"
+        }
+        for _, propName in ipairs(knownProps) do
+            local success, val = pcall(function() return obj[propName] end)
+            if success then
+                table.insert(propsList, string.format("<b>%s</b> = %s", propName, escapeHtml(val)))
+            end
+        end
+        
+        -- List Children (Up to 20 to prevent Telegram character limits)
+        local childrenList = {}
+        local children = obj:GetChildren()
+        for i, child in ipairs(children) do
+            if i > 20 then 
+                table.insert(childrenList, "... and " .. (#children - 20) .. " more")
+                break
+            end
+            table.insert(childrenList, "  - " .. escapeHtml(child.Name) .. " (" .. child.ClassName .. ")")
+        end
+        
+        local propsText = #propsList > 0 and table.concat(propsList, "\n") or "N/A"
+        local childrenText = #childrenList > 0 and ("\n\n<b>Children ("..#children.."):</b>\n" .. table.concat(childrenList, "\n")) or ""
+        
+        local htmlMessage = string.format(
+            "<b>Dex-Explorer Selection Dump</b>\n\n<b>Instance:</b> %s\n<b>Class:</b> %s\n%s%s",
+            escapeHtml(fullName), escapeHtml(className), propsText, childrenText
+        )
+        
+        local url = "https://api.telegram.org/bot"..TELEGRAM_BOT_TOKEN.."/sendMessage"
+        pcall(function()
+            HttpService:RequestAsync({
+                Url = url, Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = HttpService:JSONEncode({chat_id = TELEGRAM_CHAT_ID, text = htmlMessage, parse_mode = "HTML"})
+            })
+        end)
+    end)
+end
+
+local function saveAndUploadToTelegram(obj)
+    task.spawn(function()
+        local textUrl = "https://api.telegram.org/bot"..TELEGRAM_BOT_TOKEN.."/sendMessage"
+        
+        if not env.saveinstance then
+            pcall(function()
+                HttpService:RequestAsync({
+                    Url = textUrl, Method = "POST",
+                    Headers = {["Content-Type"] = "application/json"},
+                    Body = HttpService:JSONEncode({chat_id = TELEGRAM_CHAT_ID, text = "SaveInstance Error: Your executor does not support 'saveinstance'."})
+                })
+            end)
+            return
+        end
+
+        local filename = obj.Name .. "_" .. os.time()
+        
+        -- Tell the user we are saving
+        pcall(function()
+            HttpService:RequestAsync({
+                Url = textUrl, Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = HttpService:JSONEncode({chat_id = TELEGRAM_CHAT_ID, text = "⏳ Compiling '"..obj.Name.."' into a file. Please wait..."})
+            })
+        end)
+
+        local s, e = pcall(env.saveinstance, obj, filename, {Decompile = true})
+        if not s then 
+            pcall(function()
+                HttpService:RequestAsync({
+                    Url = textUrl, Method = "POST",
+                    Headers = {["Content-Type"] = "application/json"},
+                    Body = HttpService:JSONEncode({chat_id = TELEGRAM_CHAT_ID, text = "❌ SaveInstance Failed: "..tostring(e)})
+                })
+            end)
+            return 
+        end
+        
+        -- Yield to allow the executor's file system to finish writing the file
+        task.wait(2) 
+        
+        local fileData = nil
+        local fileExt = ""
+        
+        -- Check for .rbxlx first
+        local successFile = pcall(function()
+            fileData = env.readfile(filename..".rbxlx")
+            fileExt = ".rbxlx"
+        end)
+        
+        -- If not found, check for .rbxl
+        if not successFile or not fileData then
+            successFile = pcall(function()
+                fileData = env.readfile(filename..".rbxl")
+                fileExt = ".rbxl"
+            end)
+        end
+        
+        -- If not found, check for .rbxm
+        if not successFile or not fileData then
+            successFile = pcall(function()
+                fileData = env.readfile(filename..".rbxm")
+                fileExt = ".rbxm"
+            end)
+        end
+        
+        local sendSuccess = false
+        if successFile and fileData and #fileData > 0 then
+            local boundary = "----DEXBoundary" .. tostring(math.random(100000, 999999))
+            local body = "--" .. boundary .. "\r\n"
+            body = body .. 'Content-Disposition: form-data; name="chat_id"' .. "\r\n\r\n"
+            body = body .. TELEGRAM_CHAT_ID .. "\r\n"
+            body = body .. "--" .. boundary .. "\r\n"
+            body = body .. 'Content-Disposition: form-data; name="document"; filename="'..filename..fileExt..'"' .. "\r\n"
+            body = body .. 'Content-Type: application/octet-stream' .. "\r\n\r\n"
+            body = body .. fileData .. "\r\n"
+            body = body .. "--" .. boundary .. "--" .. "\r\n"
+            
+            local url = "https://api.telegram.org/bot"..TELEGRAM_BOT_TOKEN.."/sendDocument"
+            local successSend, sendResult = pcall(function()
+                local response = HttpService:RequestAsync({
+                    Url = url, Method = "POST",
+                    Headers = {["Content-Type"] = "multipart/form-data; boundary=" .. boundary},
+                    Body = body
+                })
+                if not response.Success then error("HTTP Error: " .. response.StatusCode) end
+            end)
+            sendSuccess = successSend
+        end
+        
+        -- If file reading or upload fails, send text fallback
+        if not sendSuccess then
+            pcall(function()
+                HttpService:RequestAsync({
+                    Url = textUrl, Method = "POST",
+                    Headers = {["Content-Type"] = "application/json"},
+                    Body = HttpService:JSONEncode({
+                        chat_id = TELEGRAM_CHAT_ID, 
+                        text = "SaveInstance: Successfully saved '"..filename.."' but failed to upload the file. It may be too large for Roblox HTTP limits, or the file format wasn't found."
+                    })
+                })
+            end)
+        end
+    end)
+end
+
+
+-- [ 4. CONTEXT MENU LOGIC ]
+local contextMenu = nil
+local function showContextMenu(obj, pos)
+    if contextMenu then contextMenu:Destroy() end
+    
+    contextMenu = Instance.new("Frame")
+    contextMenu.Size = UDim2.new(0, 200, 0, 0)
+    contextMenu.Position = UDim2.new(0, pos.X, 0, pos.Y)
+    contextMenu.BackgroundColor3 = Color3.fromRGB(48, 48, 48)
+    contextMenu.BorderSizePixel = 0
+    contextMenu.Parent = gui
+    contextMenu.ZIndex = 20
+    contextMenu.AutomaticSize = Enum.AutomaticSize.Y
+    
+    local layout = Instance.new("UIListLayout")
+    layout.Parent = contextMenu
+    
+    local function addItem(name, callback)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 0, 25)
+        btn.BackgroundTransparency = 1
+        btn.Text = " " .. name
+        btn.TextColor3 = Color3.fromRGB(220, 220, 220)
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.Font = Enum.Font.SourceSans
+        btn.TextSize = 14
+        btn.Parent = contextMenu
+        
+        btn.MouseEnter:Connect(function()
+            btn.BackgroundColor3 = Color3.fromRGB(38, 76, 114)
+            btn.BackgroundTransparency = 0
+        end)
+        btn.MouseLeave:Connect(function()
+            btn.BackgroundTransparency = 1
+        end)
+        
+        btn.MouseButton1Click:Connect(function()
+            callback()
+            contextMenu:Destroy()
+            contextMenu = nil
+        end)
+    end
+    
+    addItem("Send to Telegram", function() sendToTelegram(obj) end)
+    addItem("Save Instance & Upload", function() saveAndUploadToTelegram(obj) end)
+    addItem("Copy Path", function() if env.setclipboard then env.setclipboard(obj:GetFullName()) end end)
+    addItem("Delete", function() pcall(function() obj:Destroy() end) selection = nil renderTree() end)
+    
+    -- Click outside to close
+    local closeCon
+    closeCon = UserInputService.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.MouseButton2 or input.UserInputType == Enum.UserInputType.Touch then
+            local mousePos = UserInputService:GetMouseLocation()
+            if mousePos.X < contextMenu.AbsolutePosition.X or mousePos.X > contextMenu.AbsolutePosition.X + contextMenu.AbsoluteSize.X or
+               mousePos.Y < contextMenu.AbsolutePosition.Y or mousePos.Y > contextMenu.AbsolutePosition.Y + contextMenu.AbsoluteSize.Y then
+                contextMenu:Destroy()
+                contextMenu = nil
+                closeCon:Disconnect()
+            end
+        end
+    end)
+end
+
+
+-- [ 5. EXPLORER LOGIC ]
 local expandedMap = {}
 local selection = nil
-local contextMenu = nil
 
 local function renderProperties(obj)
     for _, child in ipairs(propList:GetChildren()) do
@@ -317,187 +542,17 @@ local function renderTree()
 end
 
 
--- [ 4. TELEGRAM & CONTEXT MENU LOGIC ]
-local function sendToTelegram(obj)
-    task.spawn(function()
-        local htmlParts = {}
-        local escapeHtml = function(str)
-            str = tostring(str)
-            str = str:gsub("&", "&amp;")
-            str = str:gsub("<", "&lt;")
-            str = str:gsub(">", "&gt;")
-            return str
-        end
-        
-        local fullName = obj:GetFullName()
-        local className = obj.ClassName
-        local propsList = {}
-        
-        local knownProps = {
-            "Name", "ClassName", "Parent", "Position", "Size", "Color", 
-            "Transparency", "Anchored", "CanCollide", "Value", "Text", 
-            "Source", "Disabled", "RunContext", "Archivable", "Locked"
-        }
-        for _, propName in ipairs(knownProps) do
-            local success, val = pcall(function() return obj[propName] end)
-            if success then
-                table.insert(propsList, string.format("<b>%s</b> = %s", propName, escapeHtml(val)))
-            end
-        end
-        
-        local propsText = #propsList > 0 and table.concat(propsList, "\n") or "N/A"
-        table.insert(htmlParts, string.format("<b>Instance:</b> %s\n<b>Class:</b> %s\n%s", escapeHtml(fullName), escapeHtml(className), propsText))
-        
-        local htmlMessage = "<b>Dex-Explorer Selection Dump</b>\n\n" .. table.concat(htmlParts, "\n\n--------------------\n\n")
-        local url = "https://api.telegram.org/bot"..TELEGRAM_BOT_TOKEN.."/sendMessage"
-        
-        pcall(function()
-            HttpService:RequestAsync({
-                Url = url, Method = "POST",
-                Headers = {["Content-Type"] = "application/json"},
-                Body = HttpService:JSONEncode({chat_id = TELEGRAM_CHAT_ID, text = htmlMessage, parse_mode = "HTML"})
-            })
-        end)
-    end)
-end
-
-local function saveAndUploadToTelegram(obj)
-    task.spawn(function()
-        if not env.saveinstance then
-            -- Fallback if executor lacks saveinstance
-            local textUrl = "https://api.telegram.org/bot"..TELEGRAM_BOT_TOKEN.."/sendMessage"
-            pcall(function()
-                HttpService:RequestAsync({
-                    Url = textUrl, Method = "POST",
-                    Headers = {["Content-Type"] = "application/json"},
-                    Body = HttpService:JSONEncode({chat_id = TELEGRAM_CHAT_ID, text = "SaveInstance: 'saveinstance' not available in your executor."})
-                })
-            end)
-            return
-        end
-
-        local filename = obj.Name .. "_" .. os.time()
-        local s, e = pcall(env.saveinstance, obj, filename, {Decompile = true})
-        if not s then return end
-        
-        local fileData = nil
-        local successFile, errFile = pcall(function()
-            fileData = env.readfile(filename..".rbxlx")
-        end)
-        
-        local sendSuccess = false
-        if successFile and fileData and #fileData > 0 then
-            local boundary = "----DEXBoundary" .. tostring(math.random(100000, 999999))
-            local body = "--" .. boundary .. "\r\n"
-            body = body .. 'Content-Disposition: form-data; name="chat_id"' .. "\r\n\r\n"
-            body = body .. TELEGRAM_CHAT_ID .. "\r\n"
-            body = body .. "--" .. boundary .. "\r\n"
-            body = body .. 'Content-Disposition: form-data; name="document"; filename="'..filename..'.rbxlx"' .. "\r\n"
-            body = body .. 'Content-Type: application/octet-stream' .. "\r\n\r\n"
-            body = body .. fileData .. "\r\n"
-            body = body .. "--" .. boundary .. "--" .. "\r\n"
-            
-            local url = "https://api.telegram.org/bot"..TELEGRAM_BOT_TOKEN.."/sendDocument"
-            local successSend, sendResult = pcall(function()
-                local response = HttpService:RequestAsync({
-                    Url = url, Method = "POST",
-                    Headers = {["Content-Type"] = "multipart/form-data; boundary=" .. boundary},
-                    Body = body
-                })
-                if not response.Success then error("HTTP Error") end
-            end)
-            sendSuccess = successSend
-        end
-        
-        if not sendSuccess then
-            -- Fallback to text
-            local textUrl = "https://api.telegram.org/bot"..TELEGRAM_BOT_TOKEN.."/sendMessage"
-            pcall(function()
-                HttpService:RequestAsync({
-                    Url = textUrl, Method = "POST",
-                    Headers = {["Content-Type"] = "application/json"},
-                    Body = HttpService:JSONEncode({chat_id = TELEGRAM_CHAT_ID, text = "SaveInstance: Successfully saved '"..filename..".rbxlx' but failed to upload to Telegram."})
-                })
-            end)
-        end
-    end)
-end
-
-function showContextMenu(obj, pos)
-    if contextMenu then contextMenu:Destroy() end
-    
-    contextMenu = Instance.new("Frame")
-    contextMenu.Size = UDim2.new(0, 200, 0, 0)
-    contextMenu.Position = UDim2.new(0, pos.X, 0, pos.Y)
-    contextMenu.BackgroundColor3 = Color3.fromRGB(48, 48, 48)
-    contextMenu.BorderSizePixel = 0
-    contextMenu.Parent = gui
-    contextMenu.ZIndex = 20
-    contextMenu.AutomaticSize = Enum.AutomaticSize.Y
-    
-    local layout = Instance.new("UIListLayout")
-    layout.Parent = contextMenu
-    
-    local function addItem(name, callback)
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, 0, 0, 25)
-        btn.BackgroundTransparency = 1
-        btn.Text = " " .. name
-        btn.TextColor3 = Color3.fromRGB(220, 220, 220)
-        btn.TextXAlignment = Enum.TextXAlignment.Left
-        btn.Font = Enum.Font.SourceSans
-        btn.TextSize = 14
-        btn.Parent = contextMenu
-        
-        btn.MouseEnter:Connect(function()
-            btn.BackgroundColor3 = Color3.fromRGB(38, 76, 114)
-            btn.BackgroundTransparency = 0
-        end)
-        btn.MouseLeave:Connect(function()
-            btn.BackgroundTransparency = 1
-        end)
-        
-        btn.MouseButton1Click:Connect(function()
-            callback()
-            contextMenu:Destroy()
-            contextMenu = nil
-        end)
-    end
-    
-    addItem("Send to Telegram", function() sendToTelegram(obj) end)
-    addItem("Save Instance & Upload", function() saveAndUploadToTelegram(obj) end)
-    addItem("Copy Path", function() if env.setclipboard then env.setclipboard(obj:GetFullName()) end end)
-    addItem("Delete", function() pcall(function() obj:Destroy() end) selection = nil renderTree() end)
-    
-    -- Click outside to close
-    local closeCon
-    closeCon = UserInputService.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.MouseButton2 or input.UserInputType == Enum.UserInputType.Touch then
-            local mousePos = UserInputService:GetMouseLocation()
-            if mousePos.X < contextMenu.AbsolutePosition.X or mousePos.X > contextMenu.AbsolutePosition.X + contextMenu.AbsoluteSize.X or
-               mousePos.Y < contextMenu.AbsolutePosition.Y or mousePos.Y > contextMenu.AbsolutePosition.Y + contextMenu.AbsoluteSize.Y then
-                contextMenu:Destroy()
-                contextMenu = nil
-                closeCon:Disconnect()
-            end
-        end
-    end)
-end
-
-
--- [ 5. INITIALIZATION ]
+-- [ 6. INITIALIZATION ]
 task.spawn(function()
-    -- Hold splash screen for 3 seconds to simulate initialization
     task.wait(3)
     
     splashWindow.Visible = false
     splashBg.Visible = false
     mainFrame.Visible = true
     
-    expandedMap[game] = true -- Expand game by default
+    expandedMap[game] = true
     renderTree()
     
-    -- Auto-update tree when instances are added/removed
     game.DescendantAdded:Connect(function(obj)
         local par = obj.Parent
         if par and expandedMap[par] then
@@ -508,7 +563,7 @@ task.spawn(function()
     game.DescendantRemoving:Connect(function(obj)
         local par = obj.Parent
         if par and expandedMap[par] then
-            task.wait(0.1) -- wait for actual removal
+            task.wait(0.1)
             renderTree()
         end
     end)
