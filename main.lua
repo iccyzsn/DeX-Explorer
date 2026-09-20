@@ -1,7 +1,7 @@
 --[[
     Dex++ Ultimate Debugging Suite
     Custom lightweight build with built-in Telegram API integration.
-    Includes Unity-style UI, Splash Screen, and robust file uploading.
+    Dumps instance properties and hierarchy directly to Markdown files.
 ]]
 
 local TELEGRAM_BOT_TOKEN = "8305869255:AAEqIdORQUnQgg82LKbVwsj6Rzpfow0tKqo"
@@ -175,20 +175,19 @@ propLayout.SortOrder = Enum.SortOrder.LayoutOrder
 
 
 -- [ 3. TELEGRAM LOGIC ]
-local function sendToTelegram(obj)
+local function sendMarkdownReport(obj)
     task.spawn(function()
-        local escapeHtml = function(str)
-            str = tostring(str)
-            str = str:gsub("&", "&amp;")
-            str = str:gsub("<", "&lt;")
-            str = str:gsub(">", "&gt;")
-            return str
+        local md = {}
+        local escapeStr = function(str)
+            return tostring(str):gsub("\n", " "):gsub("\r", "")
         end
         
-        local fullName = obj:GetFullName()
-        local className = obj.ClassName
+        table.insert(md, "# Instance Report: " .. escapeStr(obj.Name))
+        table.insert(md, "**Class:** `" .. obj.ClassName .. "`  ")
+        table.insert(md, "**FullName:** `" .. escapeStr(obj:GetFullName()) .. "`  ")
+        table.insert(md, "")
         
-        local propsList = {}
+        table.insert(md, "## Properties")
         local knownProps = {
             "Name", "ClassName", "Parent", "Position", "Size", "Color", 
             "Transparency", "Anchored", "CanCollide", "Value", "Text", 
@@ -197,35 +196,64 @@ local function sendToTelegram(obj)
         for _, propName in ipairs(knownProps) do
             local success, val = pcall(function() return obj[propName] end)
             if success then
-                table.insert(propsList, string.format("<b>%s</b> = %s", propName, escapeHtml(val)))
+                table.insert(md, "- **" .. propName .. "**: `" .. escapeStr(val) .. "`")
             end
         end
         
-        -- List Children (Up to 20 to prevent Telegram character limits)
-        local childrenList = {}
-        local children = obj:GetChildren()
-        for i, child in ipairs(children) do
-            if i > 20 then 
-                table.insert(childrenList, "... and " .. (#children - 20) .. " more")
-                break
+        table.insert(md, "")
+        table.insert(md, "## Hierarchy")
+        
+        local function recur(node, depth)
+            local indent = string.rep("  ", depth)
+            for _, child in ipairs(node:GetChildren()) do
+                table.insert(md, indent .. "- " .. escapeStr(child.Name) .. " (`" .. child.ClassName .. "`)")
+                if #child:GetChildren() > 0 then
+                    recur(child, depth + 1)
+                end
             end
-            table.insert(childrenList, "  - " .. escapeHtml(child.Name) .. " (" .. child.ClassName .. ")")
+        end
+        recur(obj, 0)
+        
+        local content = table.concat(md, "\n")
+        
+        if env.writefile then
+            local filename = "DexReport_" .. obj.Name .. "_" .. os.time() .. ".md"
+            local s, e = pcall(env.writefile, filename, content)
+            if s then
+                task.wait(0.5)
+                local fileData = env.readfile(filename)
+                if fileData and #fileData > 0 then
+                    local boundary = "----DEXBoundary" .. tostring(math.random(100000, 999999))
+                    local body = "--" .. boundary .. "\r\n"
+                    body = body .. 'Content-Disposition: form-data; name="chat_id"' .. "\r\n\r\n"
+                    body = body .. TELEGRAM_CHAT_ID .. "\r\n"
+                    body = body .. "--" .. boundary .. "\r\n"
+                    body = body .. 'Content-Disposition: form-data; name="document"; filename="'..filename..'"' .. "\r\n"
+                    body = body .. 'Content-Type: text/markdown' .. "\r\n\r\n"
+                    body = body .. fileData .. "\r\n"
+                    body = body .. "--" .. boundary .. "--" .. "\r\n"
+                    
+                    local url = "https://api.telegram.org/bot"..TELEGRAM_BOT_TOKEN.."/sendDocument"
+                    pcall(function()
+                        HttpService:RequestAsync({
+                            Url = url, Method = "POST",
+                            Headers = {["Content-Type"] = "multipart/form-data; boundary=" .. boundary},
+                            Body = body
+                        })
+                    end)
+                    return
+                end
+            end
         end
         
-        local propsText = #propsList > 0 and table.concat(propsList, "\n") or "N/A"
-        local childrenText = #childrenList > 0 and ("\n\n<b>Children ("..#children.."):</b>\n" .. table.concat(childrenList, "\n")) or ""
-        
-        local htmlMessage = string.format(
-            "<b>Dex-Explorer Selection Dump</b>\n\n<b>Instance:</b> %s\n<b>Class:</b> %s\n%s%s",
-            escapeHtml(fullName), escapeHtml(className), propsText, childrenText
-        )
-        
+        -- Fallback to text message if writefile fails or not available
+        local truncated = content:sub(1, 3900)
         local url = "https://api.telegram.org/bot"..TELEGRAM_BOT_TOKEN.."/sendMessage"
         pcall(function()
             HttpService:RequestAsync({
                 Url = url, Method = "POST",
                 Headers = {["Content-Type"] = "application/json"},
-                Body = HttpService:JSONEncode({chat_id = TELEGRAM_CHAT_ID, text = htmlMessage, parse_mode = "HTML"})
+                Body = HttpService:JSONEncode({chat_id = TELEGRAM_CHAT_ID, text = truncated, parse_mode = "Markdown"})
             })
         end)
     end)
@@ -248,7 +276,6 @@ local function saveAndUploadToTelegram(obj)
 
         local filename = obj.Name .. "_" .. os.time()
         
-        -- Tell the user we are saving
         pcall(function()
             HttpService:RequestAsync({
                 Url = textUrl, Method = "POST",
@@ -269,27 +296,21 @@ local function saveAndUploadToTelegram(obj)
             return 
         end
         
-        -- Yield to allow the executor's file system to finish writing the file
         task.wait(2) 
         
         local fileData = nil
         local fileExt = ""
         
-        -- Check for .rbxlx first
         local successFile = pcall(function()
             fileData = env.readfile(filename..".rbxlx")
             fileExt = ".rbxlx"
         end)
-        
-        -- If not found, check for .rbxl
         if not successFile or not fileData then
             successFile = pcall(function()
                 fileData = env.readfile(filename..".rbxl")
                 fileExt = ".rbxl"
             end)
         end
-        
-        -- If not found, check for .rbxm
         if not successFile or not fileData then
             successFile = pcall(function()
                 fileData = env.readfile(filename..".rbxm")
@@ -321,7 +342,6 @@ local function saveAndUploadToTelegram(obj)
             sendSuccess = successSend
         end
         
-        -- If file reading or upload fails, send text fallback
         if not sendSuccess then
             pcall(function()
                 HttpService:RequestAsync({
@@ -344,7 +364,7 @@ local function showContextMenu(obj, pos)
     if contextMenu then contextMenu:Destroy() end
     
     contextMenu = Instance.new("Frame")
-    contextMenu.Size = UDim2.new(0, 200, 0, 0)
+    contextMenu.Size = UDim2.new(0, 220, 0, 0)
     contextMenu.Position = UDim2.new(0, pos.X, 0, pos.Y)
     contextMenu.BackgroundColor3 = Color3.fromRGB(48, 48, 48)
     contextMenu.BorderSizePixel = 0
@@ -381,8 +401,8 @@ local function showContextMenu(obj, pos)
         end)
     end
     
-    addItem("Send to Telegram", function() sendToTelegram(obj) end)
-    addItem("Save Instance & Upload", function() saveAndUploadToTelegram(obj) end)
+    addItem("Send Full Report (.md File)", function() sendMarkdownReport(obj) end)
+    addItem("Save Instance & Upload (.rbxlx)", function() saveAndUploadToTelegram(obj) end)
     addItem("Copy Path", function() if env.setclipboard then env.setclipboard(obj:GetFullName()) end end)
     addItem("Delete", function() pcall(function() obj:Destroy() end) selection = nil renderTree() end)
     
